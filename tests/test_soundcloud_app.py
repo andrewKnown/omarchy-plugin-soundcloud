@@ -2564,3 +2564,13 @@ eval({json.dumps(app.api_request_capture_script())});
         self.assertIn("error", result["refused"])
         self.assertNotIn("private-test-value", completed.stdout)
         self.assertIsNotNone(app.validate_tracks_payload(result["found"]))
+
+
+class PopupKeyboardFocusTest(unittest.TestCase):
+    def test_popup_is_a_keyboard_panel_that_focuses_search(self):
+        # An xdg PopupCard only gets keys after a click routes focus through
+        # the bar, so typing in the search box did nothing.
+        source = (MODULE_PATH.parent / "BarWidget.qml").read_text()
+        self.assertIn("KeyboardPanel {", source)
+        self.assertNotIn("PopupCard {", source)
+        self.assertIn('focusTarget: root.selectedTab === "search" ? searchField : null', source)

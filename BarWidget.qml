@@ -936,8 +936,11 @@ BarWidget {
     onExited: root.bar.hideTooltip(root)
   }
 
-  PopupCard {
+  // A layer-shell panel, unlike an xdg popup, takes keyboard focus when it
+  // opens, so the search box can be typed into right away.
+  KeyboardPanel {
     id: popup
+    focusTarget: root.selectedTab === "search" ? searchField : null
     anchorItem: root
     bar: root.bar
     owner: root
