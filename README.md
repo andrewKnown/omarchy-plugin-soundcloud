@@ -38,6 +38,31 @@ without official SoundCloud API credentials.
 - Persistent SoundCloud login session
 - Local audio playback through GStreamer
 
+
+## Layout
+
+```
+soundcloud_app.py          # bar/CLI entry (thin launcher)
+soundcloud/
+  backend.py               # facade re-exporting the package surface
+  backend_constants.py     # shared limits and host allow-lists
+  paths.py                 # XDG paths, desktop entry, event log
+  store.py                 # cookie DB and private JSON stores
+  uri.py                   # URI policy and graphics workarounds
+  commands.py              # socket/bar command parsing
+  scripts.py               # JS injected into the WebKit view
+  validate.py              # payload validation / sanitization
+  artwork.py               # artwork fetch + cache
+  media.py                 # GStreamer playback + HLS/media fetch
+  api.py                   # likes API + bot-check error
+  server.py                # Unix control socket for the bar
+  mpris.py                 # MPRIS metadata helpers
+  application.py           # GTK/WebKit application factory
+  cli.py                   # check/launch/ensure/daemon entry
+BarWidget.qml              # Omarchy bar widget
+SoundCloudModel.js         # shared QML helpers
+```
+
 ## Requirements
 
 - Omarchy 4 with `omarchy-shell`
@@ -105,6 +130,7 @@ The title and buttons only show on horizontal bars.
 - Popup: artwork, metadata, playback controls, and a seekable waveform
 - Home, Feed, and Search tabs: click a track to play it
 - Bar buttons: previous, play/pause, next, and like for the loaded track
+- Unavailable or broken queued tracks are skipped automatically
 
 ## Troubleshooting
 

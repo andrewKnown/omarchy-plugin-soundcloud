@@ -1648,6 +1648,12 @@ BarWidget {
     onTriggered: {
       root.socketProbePending = false
       root.reconnectAttempt = Math.min(14, root.reconnectAttempt + 1)
+      // ensure/launch can exit 0 before the daemon is ready — or after it crashed.
+      // Stop saying "Connecting…" once probes have had a fair chance.
+      if (root.launchingBackend && root.reconnectAttempt >= 14 && !root.backendConnected) {
+        root.launchingBackend = false
+        if (!root.lastError) root.lastError = "Could not connect to SoundCloud"
+      }
       socketLoader.active = false
       socketLoader.active = true
     }

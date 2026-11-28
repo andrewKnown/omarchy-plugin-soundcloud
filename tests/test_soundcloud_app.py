@@ -15,15 +15,39 @@ from pathlib import Path
 from unittest import mock
 
 
-MODULE_PATH = Path(__file__).resolve().parents[1] / "soundcloud_app.py"
+# Implementation lives in the package; the root soundcloud_app.py is only a
+# stable launcher for the bar widget (`python3 -I soundcloud_app.py …`).
+PLUGIN_ROOT = Path(__file__).resolve().parents[1]
+MODULE_PATH = PLUGIN_ROOT / "soundcloud" / "backend.py"
+LAUNCHER_PATH = PLUGIN_ROOT / "soundcloud_app.py"
 
 
 def load_module():
-    spec = importlib.util.spec_from_file_location("soundcloud_app", MODULE_PATH)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
+    root = str(PLUGIN_ROOT)
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    # Drop cached package modules so patches and private state start clean.
+    for name in list(sys.modules):
+        if name == "soundcloud" or name.startswith("soundcloud."):
+            del sys.modules[name]
+    import soundcloud.backend as module
+    sys.modules["soundcloud_app"] = module
     return module
+
+def package_source() -> str:
+    """Concatenation of implementation modules for source-inspection tests."""
+    names = [
+        "backend_constants.py", "paths.py", "uri.py", "store.py", "commands.py",
+        "scripts.py", "validate.py", "artwork.py", "media.py", "api.py",
+        "server.py", "mpris.py", "application.py", "cli.py", "backend.py",
+    ]
+    parts = []
+    for name in names:
+        path = PLUGIN_ROOT / "soundcloud" / name
+        if path.exists():
+            parts.append(path.read_text())
+    return "\n".join(parts)
+
 
 
 class ProfilePathsTest(unittest.TestCase):
@@ -254,14 +278,27 @@ class UriPolicyTest(unittest.TestCase):
 
 
 class GraphicsWorkaroundTest(unittest.TestCase):
-    def test_disables_webkit_dmabuf_on_hyprland(self):
+    def test_disables_webkit_dmabuf_on_hyprland_without_nvidia(self):
         app = load_module()
         env = {"HYPRLAND_INSTANCE_SIGNATURE": "instance", "XDG_SESSION_TYPE": "wayland"}
 
-        changed = app.apply_graphics_workarounds(env)
+        with mock.patch("soundcloud.uri.nvidia_driver_loaded", return_value=False):
+            changed = app.apply_graphics_workarounds(env)
 
         self.assertTrue(changed)
         self.assertEqual(env["WEBKIT_DISABLE_DMABUF_RENDERER"], "1")
+        self.assertNotIn("__NV_DISABLE_EXPLICIT_SYNC", env)
+
+    def test_nvidia_keeps_dmabuf_and_disables_explicit_sync(self):
+        app = load_module()
+        env = {"HYPRLAND_INSTANCE_SIGNATURE": "instance"}
+
+        with mock.patch("soundcloud.uri.nvidia_driver_loaded", return_value=True):
+            changed = app.apply_graphics_workarounds(env)
+
+        self.assertTrue(changed)
+        self.assertEqual(env["__NV_DISABLE_EXPLICIT_SYNC"], "1")
+        self.assertNotIn("WEBKIT_DISABLE_DMABUF_RENDERER", env)
 
     def test_preserves_an_explicit_renderer_setting(self):
         app = load_module()
@@ -270,7 +307,8 @@ class GraphicsWorkaroundTest(unittest.TestCase):
             "WEBKIT_DISABLE_DMABUF_RENDERER": "0",
         }
 
-        changed = app.apply_graphics_workarounds(env)
+        with mock.patch("soundcloud.uri.nvidia_driver_loaded", return_value=False):
+            changed = app.apply_graphics_workarounds(env)
 
         self.assertFalse(changed)
         self.assertEqual(env["WEBKIT_DISABLE_DMABUF_RENDERER"], "0")
@@ -282,8 +320,10 @@ class BackendCommandTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "pagination.log"
             fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
-            setattr(app, "_event_log_fd", fd)
-            setattr(app, "MAX_EVENT_LOG_BYTES", 320)
+            import soundcloud.paths as paths
+            import soundcloud.backend_constants as constants
+            setattr(paths, "_event_log_fd", fd)
+            setattr(constants, "MAX_EVENT_LOG_BYTES", 320)
             try:
                 app.log_event("untrusted-event", secret="must-not-appear")
                 for count in range(12):
@@ -305,7 +345,7 @@ class BackendCommandTest(unittest.TestCase):
                 self.assertEqual(record["event"], "track-page")
                 self.assertEqual(record["source"], "feed")
 
-        source = MODULE_PATH.read_text()
+        source = package_source()
         self.assertIn("stderr=subprocess.DEVNULL", source)
         self.assertIn("pass_fds=(event_log_fd,)", source)
 
@@ -1004,7 +1044,7 @@ eval({json.dumps(script)});
     def test_backend_resolution_timeout_invalidates_the_waiting_webkit_generation(self):
         app = load_module()
         script = app.api_request_capture_script()
-        source = MODULE_PATH.read_text()
+        source = package_source()
 
         self.assertIn("const waitDeadline = Date.now() + 30000", script)
         timeout_method = source[source.index("def _resolution_timed_out"):source.index(
@@ -1105,7 +1145,7 @@ eval({json.dumps(script)});
     def test_hls_fetch_has_deadline_cancellation_and_proxy_isolation(self):
         app = load_module()
         self.assertEqual(app.HLS_MAX_WORKERS, 2)
-        self.assertIn("ProxyHandler({})", MODULE_PATH.read_text())
+        self.assertIn("ProxyHandler({})", package_source())
         with self.assertRaises(TimeoutError):
             app.fetch_private_media(
                 "https://cf-media.sndcdn.com/a", 10, deadline=time.monotonic() - 1
@@ -1437,7 +1477,7 @@ eval({json.dumps(capture_script)});
         self.assertNotIn("token=private", completed.stdout)
 
     def test_injected_track_scripts_do_not_extract_or_replay_frontend_credentials(self):
-        source = MODULE_PATH.read_text()
+        source = package_source()
 
         self.assertNotIn("def tracks_script", source)
         self.assertNotIn("__omarchyMetadataResources", source)
@@ -1854,7 +1894,7 @@ class LaunchBackendTest(unittest.TestCase):
                 "Type=Application\n"
                 "Name=SoundCloud\n"
                 "Comment=SoundCloud playback and browsing in Omarchy\n"
-                f"Exec=/usr/bin/python3 -I {MODULE_PATH.resolve()} launch\n"
+                f"Exec=/usr/bin/python3 -I {LAUNCHER_PATH.resolve()} launch\n"
                 "Icon=audio-x-generic\n"
                 "Terminal=false\n"
                 "Categories=AudioVideo;Audio;Player;\n"
@@ -1864,7 +1904,7 @@ class LaunchBackendTest(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o644)
 
     def test_bar_widget_registers_the_application_menu_launcher_without_starting_playback(self):
-        qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
+        qml = (PLUGIN_ROOT / "BarWidget.qml").read_text()
 
         self.assertIn('"install-desktop-entry"', qml)
         self.assertIn("id: desktopEntryProcess", qml)
@@ -1902,10 +1942,20 @@ class LaunchBackendTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual(json.loads(stdout.getvalue())["error"], self.missing["error"])
 
+    def test_application_module_imports_private_helpers_star_import_skips(self):
+        # build_application runs via soundcloud.application, not the facade;
+        # star-imports omit _names, so these must be imported explicitly.
+        from soundcloud import application
+
+        self.assertTrue(callable(application._load_gi))
+        self.assertTrue(callable(application._NullConnection))
+        self.assertTrue(callable(application._bounded_string))
+        self.assertTrue(callable(application._bounded_integer))
+
 
 class BarWidgetTest(unittest.TestCase):
     def test_runtime_commands_use_one_persistent_socket(self):
-        qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
+        qml = (PLUGIN_ROOT / "BarWidget.qml").read_text()
 
         self.assertIn("Socket {", qml)
         self.assertIn("SplitParser {", qml)
@@ -1917,7 +1967,7 @@ class BarWidgetTest(unittest.TestCase):
         self.assertIn("maxSocketFrameChars", qml)
 
     def test_connected_backend_never_sends_unsupported_launch_command(self):
-        qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
+        qml = (PLUGIN_ROOT / "BarWidget.qml").read_text()
 
         self.assertIn('if (action === "launch") return "show"', qml)
         self.assertIn("function initializeConnection()", qml)
@@ -1925,15 +1975,21 @@ class BarWidgetTest(unittest.TestCase):
         self.assertIn('sendCommand("status", "status")', qml)
         self.assertIn("onBackendConnectedChanged: initializeConnection()", qml)
 
+    def test_connecting_label_clears_after_failed_reconnect_budget(self):
+        qml = (PLUGIN_ROOT / "BarWidget.qml").read_text()
+
+        self.assertIn('root.lastError = "Could not connect to SoundCloud"', qml)
+        self.assertIn("root.launchingBackend && root.reconnectAttempt >= 14", qml)
+
     def test_track_label_is_tooltip_only(self):
-        qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
+        qml = (PLUGIN_ROOT / "BarWidget.qml").read_text()
 
         self.assertNotIn('visible: !root.bar.vertical && root.title !== ""', qml)
         self.assertIn("showTooltip(root, root.safeTooltipLabel)", qml)
         self.assertIn('replace(/[<>&', qml)
 
     def test_bar_remains_icon_only_while_popup_uses_artwork(self):
-        qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
+        qml = (PLUGIN_ROOT / "BarWidget.qml").read_text()
 
         self.assertNotIn("id: barArtwork", qml)
         self.assertIn('text: ""', qml)
@@ -1942,8 +1998,8 @@ class BarWidgetTest(unittest.TestCase):
         self.assertNotIn("source: root.artUrl", qml)
 
     def test_track_list_requests_bounded_backend_artwork_by_token(self):
-        qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
-        source = MODULE_PATH.read_text()
+        qml = (PLUGIN_ROOT / "BarWidget.qml").read_text()
+        source = package_source()
 
         self.assertIn('"artwork:" + artworkId', qml)
         self.assertIn("source: trackArtDataUrl", qml)
@@ -1953,7 +2009,7 @@ class BarWidgetTest(unittest.TestCase):
         self.assertIn("LIST_ARTWORK_BYTES", source)
 
     def test_track_list_displays_play_count_and_duration(self):
-        qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
+        qml = (PLUGIN_ROOT / "BarWidget.qml").read_text()
 
         self.assertIn("formatCompactCount", qml)
         self.assertIn("track.playCount", qml)
@@ -1963,7 +2019,7 @@ class BarWidgetTest(unittest.TestCase):
     def test_theme_colors_follow_bar_palette(self):
         import re
 
-        qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
+        qml = (PLUGIN_ROOT / "BarWidget.qml").read_text()
         self.assertIn("readonly property color dim: Qt.darker(bar.foreground, 1.5)", qml)
         self.assertIn("function onForegroundChanged() { waveform.requestPaint() }", qml)
         self.assertEqual(re.findall(r"#[0-9A-Fa-f]{6}", qml), [])
@@ -1971,7 +2027,7 @@ class BarWidgetTest(unittest.TestCase):
     def test_every_qml_text_sink_is_plain_text(self):
         import re
 
-        qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
+        qml = (PLUGIN_ROOT / "BarWidget.qml").read_text()
         missing = []
         for match in re.finditer(r"\bText\s*\{", qml):
             index, depth = match.end(), 1
@@ -1983,21 +2039,21 @@ class BarWidgetTest(unittest.TestCase):
         self.assertEqual(missing, [])
 
     def test_launcher_is_isolated_and_does_not_collect_unbounded_stderr(self):
-        qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
+        qml = (PLUGIN_ROOT / "BarWidget.qml").read_text()
 
         self.assertIn('["/usr/bin/python3", "-I", helperPath', qml)
         self.assertNotIn("StdioCollector", qml)
         self.assertNotIn("Component.onCompleted: startBackend", qml)
 
     def test_webkit_profile_is_ephemeral_and_backend_watches_removal(self):
-        source = MODULE_PATH.read_text()
+        source = package_source()
 
         self.assertIn("WebsiteDataManager.new_ephemeral()", source)
         self.assertNotIn("set_persistent_storage", source)
         self.assertIn("def _check_installation", source)
 
     def test_popup_uses_seekable_waveform_instead_of_feed_buttons(self):
-        qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
+        qml = (PLUGIN_ROOT / "BarWidget.qml").read_text()
 
         # Likes is a list tab fed by the API, not a button that navigates the page.
         self.assertNotIn('runAction("likes"', qml)
@@ -2007,7 +2063,7 @@ class BarWidgetTest(unittest.TestCase):
         self.assertIn('root.runAction("seek"', qml)
 
     def test_popup_has_larger_scrollable_home_and_feed_browser(self):
-        qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
+        qml = (PLUGIN_ROOT / "BarWidget.qml").read_text()
 
         self.assertIn("Style.space(440)", qml)
         self.assertIn("Style.space(560)", qml)
@@ -2019,7 +2075,7 @@ class BarWidgetTest(unittest.TestCase):
         self.assertNotIn('root.runAction("play-url"', qml)
 
     def test_track_selection_avoids_transient_signed_out_and_optimistic_metadata(self):
-        qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
+        qml = (PLUGIN_ROOT / "BarWidget.qml").read_text()
 
         self.assertIn("reportsLoggedOut", qml)
         self.assertIn("root.loggedIn && !reportsLoggedOut", qml)
@@ -2032,7 +2088,7 @@ class BarWidgetTest(unittest.TestCase):
         self.assertIn('kind === "selection"', qml)
 
     def test_tab_loading_preserves_now_playing_state_and_each_tab_cache(self):
-        qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
+        qml = (PLUGIN_ROOT / "BarWidget.qml").read_text()
 
         self.assertIn("property var homeTracks", qml)
         self.assertIn("property var feedTracks", qml)
@@ -2040,7 +2096,7 @@ class BarWidgetTest(unittest.TestCase):
         self.assertIn("if (!preserveMetadata)", qml)
 
     def test_track_refresh_requests_the_selected_route_bound_api_source(self):
-        qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
+        qml = (PLUGIN_ROOT / "BarWidget.qml").read_text()
 
         self.assertIn(
             'sendCommand("tracks:" + selectedTab, "tracks:" + selectedTab)',
@@ -2048,12 +2104,12 @@ class BarWidgetTest(unittest.TestCase):
         )
 
     def test_pending_track_fetch_preserves_the_tab_cache(self):
-        qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
+        qml = (PLUGIN_ROOT / "BarWidget.qml").read_text()
 
         self.assertIn("SoundCloudModel.applyTrackResult(cached, result)", qml)
 
     def test_track_refresh_has_no_legacy_navigation_delay(self):
-        qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
+        qml = (PLUGIN_ROOT / "BarWidget.qml").read_text()
 
         self.assertNotIn("interval: 1400", qml)
         self.assertIn("interval: 100", qml)
@@ -2062,7 +2118,7 @@ class BarWidgetTest(unittest.TestCase):
         self.assertIn('if (message.type === "tracks")', qml)
 
     def test_track_lists_request_more_before_reaching_the_exact_end(self):
-        qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
+        qml = (PLUGIN_ROOT / "BarWidget.qml").read_text()
 
         self.assertNotIn("onContentYChanged: root.loadMoreTracks", qml)
         self.assertNotIn("onCountChanged: root.loadMoreTracks", qml)
@@ -2073,13 +2129,13 @@ class BarWidgetTest(unittest.TestCase):
         self.assertIn('sendCommand("load-more:" + selectedTab', qml)
 
     def test_lazy_loading_has_bounded_observability_events(self):
-        source = MODULE_PATH.read_text()
+        source = package_source()
 
         self.assertIn('"lazy-load-request"', source)
         self.assertIn('"track-page"', source)
 
     def test_coalesced_socket_frames_are_limited_after_complete_lines_are_parsed(self):
-        qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
+        qml = (PLUGIN_ROOT / "BarWidget.qml").read_text()
         function = qml[qml.index("function handleSocketChunk"):qml.index(
             "onBackendConnectedChanged"
         )]
@@ -2090,7 +2146,7 @@ class BarWidgetTest(unittest.TestCase):
         self.assertIn("if (line.length > maxSocketFrameChars)", function)
 
     def test_disconnect_clears_partial_frames_and_inflight_request_state(self):
-        qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
+        qml = (PLUGIN_ROOT / "BarWidget.qml").read_text()
 
         self.assertIn("function resetConnectionState()", qml)
         self.assertIn('socketBuffer = ""', qml)
@@ -2100,7 +2156,7 @@ class BarWidgetTest(unittest.TestCase):
         self.assertIn("root.resetConnectionState()", qml)
 
     def test_empty_navigation_status_updates_timeline_without_erasing_metadata(self):
-        qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
+        qml = (PLUGIN_ROOT / "BarWidget.qml").read_text()
 
         self.assertIn("var preserveMetadata", qml)
         self.assertIn("SoundCloudModel.shouldPreservePlaybackMetadata(state, root.title)", qml)
@@ -2113,19 +2169,19 @@ class BarWidgetTest(unittest.TestCase):
         self.assertNotIn('if (!hasIncomingTrack && root.title !== "") return', qml)
 
     def test_now_playing_sections_keep_their_layout_while_data_is_missing(self):
-        qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
+        qml = (PLUGIN_ROOT / "BarWidget.qml").read_text()
 
         self.assertIn("property bool hasTrack", qml)
         self.assertIn("opacity: root.hasTrack ? 1 : 0.45", qml)
         self.assertNotIn('visible: root.running && root.loggedIn && root.title !== ""', qml)
 
     def test_popup_has_no_bottom_shortcut_help_text(self):
-        qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
+        qml = (PLUGIN_ROOT / "BarWidget.qml").read_text()
 
         self.assertNotIn("Middle-click: play/pause", qml)
 
     def test_track_browser_fills_remaining_popup_height(self):
-        qml = (MODULE_PATH.parent / "BarWidget.qml").read_text()
+        qml = (PLUGIN_ROOT / "BarWidget.qml").read_text()
 
         self.assertIn(
             "height: Math.max(0, parent.height - y - (errorText.visible",
@@ -2135,7 +2191,7 @@ class BarWidgetTest(unittest.TestCase):
         self.assertNotIn("height: Style.space(178)", qml)
 
     def test_readme_documents_safe_removal_and_persistent_state(self):
-        readme = (MODULE_PATH.parent / "README.md").read_text()
+        readme = (PLUGIN_ROOT / "README.md").read_text()
 
         self.assertIn("## Removing", readme)
         self.assertIn("omarchy plugin remove brunosilveira.soundcloud", readme)
@@ -2300,6 +2356,17 @@ class QueueLibraryAndMprisTest(unittest.TestCase):
         self.assertIsNone(app.queue_step(3, 2, 1))
         self.assertIsNone(app.queue_step(3, 0, -1))
         self.assertIsNone(app.queue_step(0, -1, 1))
+
+    def test_unavailable_tracks_auto_skip_until_budget_runs_out(self):
+        app = load_module()
+        self.assertTrue(app.should_auto_skip_unavailable("error", 3, 0))
+        self.assertTrue(app.should_auto_skip_unavailable("error", 3, 2))
+        self.assertFalse(app.should_auto_skip_unavailable("error", 3, 3))
+        self.assertFalse(app.should_auto_skip_unavailable("playing", 3, 0))
+        self.assertFalse(app.should_auto_skip_unavailable("error", 0, 0))
+        self.assertFalse(app.should_auto_skip_unavailable("error", 3, 0, page_playing=True))
+        self.assertFalse(app.should_auto_skip_unavailable("error", 40, 25))
+        self.assertTrue(app.should_auto_skip_unavailable("error", 40, 24))
 
     def test_collections_are_validated_and_offsite_artwork_dropped(self):
         app = load_module()
@@ -2502,7 +2569,7 @@ eval({json.dumps(app.api_request_capture_script())});
         self.assertNotIn("private-test-value", completed.stdout)
 
     def test_widget_has_mixes_tab_and_shuffle_button(self):
-        source = (MODULE_PATH.parent / "BarWidget.qml").read_text()
+        source = (PLUGIN_ROOT / "BarWidget.qml").read_text()
         self.assertIn('onClicked: root.selectTab("mixes")', source)
         self.assertIn('sendCommand("mixes", "mixes")', source)
         self.assertIn('sendCommand("shuffle:" + listSource(), "action")', source)
@@ -2511,8 +2578,8 @@ eval({json.dumps(app.api_request_capture_script())});
 
     def test_opened_collection_reply_is_matched_by_collection_id(self):
         # Replies carry the request number in "id", so the collection travels as collectionId.
-        source = (MODULE_PATH.parent / "BarWidget.qml").read_text()
-        backend = MODULE_PATH.read_text()
+        source = (PLUGIN_ROOT / "BarWidget.qml").read_text()
+        backend = package_source()
         self.assertIn("Number(message.collectionId) !== openedCollection.id", source)
         self.assertNotIn("Number(message.id) !== openedCollection.id", source)
         self.assertIn('{"kind": kind, "collectionId": identifier}', backend)
@@ -2570,7 +2637,7 @@ class PopupKeyboardFocusTest(unittest.TestCase):
     def test_popup_is_a_keyboard_panel_that_focuses_search(self):
         # An xdg PopupCard only gets keys after a click routes focus through
         # the bar, so typing in the search box did nothing.
-        source = (MODULE_PATH.parent / "BarWidget.qml").read_text()
+        source = (PLUGIN_ROOT / "BarWidget.qml").read_text()
         self.assertIn("KeyboardPanel {", source)
         self.assertNotIn("PopupCard {", source)
         self.assertIn('focusTarget: root.selectedTab === "search" ? searchField : null', source)
